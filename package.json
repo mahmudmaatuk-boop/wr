@@ -1,0 +1,10 @@
+{
+  "name": "wr",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WR — personal client tracker (installable web app)",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  }
+}
