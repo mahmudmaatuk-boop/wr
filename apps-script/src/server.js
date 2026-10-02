@@ -1,0 +1,661 @@
+// ---------------------------------------------------------------------------
+// WR server: keeps WR's pages in Google Sheets and its photos and documents in
+// Google Drive, inside the account that runs this script.
+//
+// 1. Run setup() once from the editor (it prints the access key).
+// 2. Deploy → New deployment → Web app: Execute as "Me", access "Anyone".
+// 3. Type the web app URL and the access key into WR → Settings.
+// ---------------------------------------------------------------------------
+
+var WR_VERSION = '2.0.0';
+var TIME_ZONE = 'Asia/Beirut';
+var MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
+  'August', 'September', 'October', 'November', 'December'];
+var HEADER_BG = '#5C3A21';
+var HEADER_FG = '#FFFFFF';
+var TEXT_TYPES = ['id', 'text', 'tel', 'email', 'url', 'month', 'dims', 'select', 'choice', 'photos'];
+var MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+
+// Totals shown on the Summary tab of the backup.
+var SUMMARY_TOTALS = [
+  { page: 'clients', key: 'paid', label: 'Client info: paid amount (Paid)', where: ['payment', 'Paid'], money: true },
+  { page: 'expenses', key: 'total', label: 'Monthly expenses: all months', money: true },
+  { page: 'monthly', key: 'amountPaid', label: 'Client info monthly: amount paid', money: true },
+  { page: 'vat', key: 'vat', label: 'VAT: VAT 11%', money: true },
+  { page: 'vat', key: 'total', label: 'VAT: total amount due', money: true },
+  { page: 'packing', key: 'volume', label: 'Packing & Shipments: volume (m³)' },
+  { page: 'raw', key: 'qty', label: 'Raw Stockage: total qty' },
+];
+
+// --------------------------- run from the editor ---------------------------
+
+function setup() {
+  var props = PropertiesService.getScriptProperties();
+  if (!props.getProperty('KEY')) props.setProperty('KEY', newKey_());
+  var root = rootFolder_();
+  folder_('PHOTOS_FOLDER_ID', 'Photos', root);
+  folder_('DOCS_FOLDER_ID', 'WR-Documents', root);
+  SCHEMA.pages.forEach(function (page) {
+    var ss = spreadsheet_(page);
+    if (page.kind === 'backup') summarySheet_(ss);
+    else if (page.kind === 'month-tabs') monthTab_(ss, page, monthKey_(new Date()));
+    else mainTab_(page);
+  });
+  ensureBackupTrigger_();
+  var message = [
+    'WR is ready.',
+    'Access key (type it into WR → Settings): ' + props.getProperty('KEY'),
+    'WR folder in Google Drive: ' + root.getUrl(),
+    'Next: Deploy → New deployment → Web app (Execute as: Me, Who has access: Anyone).',
+  ].join('\n');
+  Logger.log(message);
+  return message;
+}
+
+/** Make a new access key. Every phone then needs the new key in WR → Settings. */
+function resetKey() {
+  var key = newKey_();
+  PropertiesService.getScriptProperties().setProperty('KEY', key);
+  Logger.log('New access key: ' + key + '\nType it into WR → Settings on every phone.');
+  return key;
+}
+
+/** Runs on the 1st of every month (installed by setup). */
+function scheduledBackup() {
+  return withLock_(runBackup_);
+}
+
+// ------------------------------- web app -----------------------------------
+
+function doGet() {
+  return json_({ ok: true, app: 'WR', version: WR_VERSION });
+}
+
+function doPost(e) {
+  var res;
+  try {
+    var req = JSON.parse((e && e.postData && e.postData.contents) || 'null');
+    res = handle_(req);
+    res.ok = true;
+  } catch (err) {
+    res = {
+      ok: false,
+      code: err.code || (err instanceof SyntaxError ? 'bad_request' : 'server'),
+      error: String(err.message || err),
+    };
+  }
+  return json_(res);
+}
+
+function handle_(req) {
+  if (!req || typeof req !== 'object') throw wrError_('bad_request', 'Invalid request.');
+  var props = PropertiesService.getScriptProperties();
+  var key = props.getProperty('KEY');
+  if (!key) throw wrError_('not_setup', 'Run setup() in the Apps Script editor first.');
+  if (!safeEqual_(String(req.key || ''), key)) throw wrError_('unauthorized', 'Wrong access key. Check WR → Settings.');
+  switch (req.action) {
+    case 'ping':
+      return { version: WR_VERSION, timeZone: TIME_ZONE, lastBackup: props.getProperty('LAST_BACKUP') || '' };
+    case 'status':
+      return status_();
+    case 'list':
+      return withLock_(function () { return list_(dataPage_(req.page)); });
+    case 'save':
+      return withLock_(function () { return { row: save_(dataPage_(req.page), req) }; });
+    case 'delete':
+      return withLock_(function () { return delete_(dataPage_(req.page), req.id); });
+    case 'getFile':
+      return getFile_(req.id);
+    case 'backup':
+      return withLock_(runBackup_);
+    default:
+      throw wrError_('bad_request', 'Unknown action.');
+  }
+}
+
+// -------------------------------- records ----------------------------------
+
+function list_(page) {
+  var rows = [];
+  pageSheets_(page).sort(byName_).forEach(function (sheet) {
+    readSheet_(sheet).rows.forEach(function (r) { rows.push(outRow_(r.data)); });
+  });
+  return { rows: rows };
+}
+
+function save_(page, req) {
+  var id = String(req.id || '').trim();
+  if (!id) throw wrError_('bad_request', 'Missing record ID.');
+  var input = req.row || {};
+  var found = findRecord_(page, id);
+  var old = found ? found.data : null;
+  if (page.kind === 'documents' && !old && !(req.file && req.file.data)) {
+    throw wrError_('bad_request', 'Choose a file to upload.');
+  }
+
+  var sheet;
+  if (page.kind === 'month-tabs') {
+    var monthHeader = header_(page, 'month');
+    var month = String(input[monthHeader] || (old && old[monthHeader]) || '');
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) throw wrError_('bad_request', 'Choose a month.');
+    sheet = monthTab_(spreadsheet_(page), page, month);
+  } else {
+    sheet = mainTab_(page);
+  }
+
+  var record = buildRecord_(page, id, input, old, req.file);
+  var headers = headers_(sheet);
+  var line = headers.map(function (h) {
+    if (Object.prototype.hasOwnProperty.call(record, h)) return escapeCell_(record[h]);
+    return old && old[h] !== undefined ? escapeCell_(old[h]) : '';
+  });
+
+  if (found && found.sheet.getName() !== sheet.getName()) {
+    found.sheet.deleteRow(found.rowNum); // the month changed: move the row to its new tab
+    found = null;
+  }
+  ensureSize_(sheet, 0, line.length);
+  if (found) sheet.getRange(found.rowNum, 1, 1, line.length).setValues([line]);
+  else sheet.appendRow(line);
+
+  var out = {};
+  headers.forEach(function (h, i) { if (h) out[h] = record.hasOwnProperty(h) ? record[h] : line[i]; });
+  return outRow_(out);
+}
+
+function buildRecord_(page, id, input, old, file) {
+  var rec = {};
+  page.columns.forEach(function (col) {
+    var h = col.header;
+    var given = Object.prototype.hasOwnProperty.call(input, h);
+    if (col.type === 'id') {
+      rec[h] = id;
+    } else if (col.type === 'timestamp') {
+      if (col.touch) rec[h] = new Date();
+      else if (old && old[h]) rec[h] = old[h];
+      else rec[h] = parseDate_(input[h]) || new Date();
+    } else if (col.type === 'photos') {
+      rec[h] = given ? savePhotos_(page, old ? old[h] : '', input[h]) : (old ? old[h] : '');
+    } else if (given) {
+      rec[h] = cellIn_(col, input[h]);
+    } else {
+      rec[h] = old && old[h] !== undefined ? old[h] : '';
+    }
+  });
+
+  if (page.kind === 'documents') {
+    var fileKeys = ['fileName', 'fileType', 'size', 'link', 'fileId'];
+    if (old) {
+      fileKeys.forEach(function (k) { rec[header_(page, k)] = old[header_(page, k)]; });
+    } else {
+      var stored = storeDocument_(file);
+      rec[header_(page, 'fileName')] = stored.name;
+      rec[header_(page, 'fileType')] = stored.type;
+      rec[header_(page, 'size')] = stored.size;
+      rec[header_(page, 'link')] = stored.url;
+      rec[header_(page, 'fileId')] = stored.id;
+      if (!rec[header_(page, 'title')]) rec[header_(page, 'title')] = stored.name;
+    }
+  }
+  return rec;
+}
+
+function delete_(page, id) {
+  var found = findRecord_(page, String(id || ''));
+  if (!found) return { deleted: false };
+  page.columns.forEach(function (col) {
+    if (col.type === 'photos') lines_(found.data[col.header]).forEach(trashPhoto_);
+  });
+  if (page.kind === 'documents') trashDocument_(found.data[header_(page, 'fileId')]);
+  found.sheet.deleteRow(found.rowNum);
+  return { deleted: true };
+}
+
+function findRecord_(page, id) {
+  var sheets = pageSheets_(page);
+  for (var i = 0; i < sheets.length; i++) {
+    var rows = readSheet_(sheets[i]).rows;
+    for (var j = 0; j < rows.length; j++) {
+      if (String(rows[j].data.ID) === id) return { sheet: sheets[i], rowNum: rows[j].rowNum, data: rows[j].data };
+    }
+  }
+  return null;
+}
+
+/** All non-empty rows as { header: value }. Rows typed by hand get an ID. */
+function readSheet_(sheet) {
+  var lastRow = sheet.getLastRow();
+  var lastCol = sheet.getLastColumn();
+  if (lastRow < 1 || lastCol < 1) return { headers: [], rows: [] };
+  var values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+  var headers = values[0].map(function (h) { return String(h).trim(); });
+  var idCol = headers.indexOf('ID');
+  var rows = [];
+  for (var r = 1; r < values.length; r++) {
+    var line = values[r];
+    if (line.every(function (v) { return v === '' || v === null; })) continue;
+    var data = {};
+    headers.forEach(function (h, c) { if (h) data[h] = line[c]; });
+    if (idCol !== -1 && !data.ID) {
+      data.ID = Utilities.getUuid();
+      sheet.getRange(r + 1, idCol + 1).setValue(data.ID);
+    }
+    rows.push({ rowNum: r + 1, data: data });
+  }
+  return { headers: headers, rows: rows };
+}
+
+function cellIn_(col, v) {
+  if (v === null || v === undefined) return '';
+  if (col.type === 'money' || col.type === 'number') {
+    if (v === '') return '';
+    var n = Number(v);
+    return isFinite(n) ? n : '';
+  }
+  if (typeof v === 'object') return '';
+  return String(v);
+}
+
+/** Text starting with "=" would become a formula; the quote keeps it as text. */
+function escapeCell_(v) {
+  return typeof v === 'string' && v.charAt(0) === '=' ? "'" + v : v;
+}
+
+function outRow_(data) {
+  var out = {};
+  Object.keys(data).forEach(function (k) { out[k] = isDate_(data[k]) ? data[k].toISOString() : data[k]; });
+  return out;
+}
+
+// ------------------------- photos and documents ----------------------------
+
+function savePhotos_(page, oldCell, value) {
+  var before = lines_(oldCell);
+  var keep = (value && value.keep ? value.keep : []).map(String).filter(function (u) { return before.indexOf(u) !== -1; });
+  var uploads = value && value.uploads ? value.uploads : [];
+  var added = [];
+  if (uploads.length) {
+    var photosRoot = folder_('PHOTOS_FOLDER_ID', 'Photos', rootFolder_());
+    var folder = folder_('PHOTOS_' + page.key, page.title, photosRoot);
+    added = uploads.map(function (u, i) {
+      var bytes = Utilities.base64Decode(String(u.data || ''));
+      if (bytes.length > MAX_UPLOAD_BYTES) throw wrError_('too_large', 'A photo is larger than 25 MB.');
+      var file = folder.createFile(Utilities.newBlob(bytes, u.type || 'image/jpeg', u.name || ('photo-' + (i + 1) + '.jpg')));
+      file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+      return file.getUrl();
+    });
+  }
+  before.filter(function (u) { return keep.indexOf(u) === -1; }).forEach(trashPhoto_);
+  return keep.concat(added).join('\n');
+}
+
+function trashPhoto_(url) {
+  var id = driveId_(url);
+  if (!id) return;
+  try {
+    var file = DriveApp.getFileById(id);
+    if (inFolder_(file, PropertiesService.getScriptProperties().getProperty('PHOTOS_FOLDER_ID'), 2)) file.setTrashed(true);
+  } catch (e) { /* already gone */ }
+}
+
+function storeDocument_(file) {
+  var bytes = Utilities.base64Decode(String(file.data));
+  if (bytes.length > MAX_UPLOAD_BYTES) throw wrError_('too_large', 'Files must be 25 MB or smaller.');
+  var blob = Utilities.newBlob(bytes, file.type || 'application/octet-stream', file.name || 'Document');
+  var doc = folder_('DOCS_FOLDER_ID', 'WR-Documents', rootFolder_()).createFile(blob);
+  return { id: doc.getId(), name: doc.getName(), type: file.type || doc.getMimeType(), size: formatBytes_(bytes.length), url: doc.getUrl() };
+}
+
+function getFile_(id) {
+  var page = dataPage_('documents');
+  var found = withLock_(function () { return findRecord_(page, String(id || '')); });
+  if (!found) throw wrError_('not_found', 'Document not found.');
+  var file = null;
+  try { file = DriveApp.getFileById(String(found.data[header_(page, 'fileId')])); } catch (e) { file = null; }
+  var docs = PropertiesService.getScriptProperties().getProperty('DOCS_FOLDER_ID');
+  if (!file || file.isTrashed() || !inFolder_(file, docs, 1)) throw wrError_('not_found', 'The file is missing from Google Drive.');
+  return { name: file.getName(), type: file.getMimeType(), data: Utilities.base64Encode(file.getBlob().getBytes()) };
+}
+
+function trashDocument_(fileId) {
+  try {
+    var file = DriveApp.getFileById(String(fileId));
+    if (inFolder_(file, PropertiesService.getScriptProperties().getProperty('DOCS_FOLDER_ID'), 1)) file.setTrashed(true);
+  } catch (e) { /* already gone */ }
+}
+
+function inFolder_(item, folderId, depth) {
+  if (!folderId || depth < 1) return false;
+  var parents = item.getParents();
+  while (parents.hasNext()) {
+    var parent = parents.next();
+    if (parent.getId() === folderId || inFolder_(parent, folderId, depth - 1)) return true;
+  }
+  return false;
+}
+
+function driveId_(url) {
+  var m = String(url || '').match(/\/d\/([\w-]{10,})|[?&]id=([\w-]{10,})/);
+  return m ? (m[1] || m[2]) : null;
+}
+
+// --------------------------------- backup ----------------------------------
+
+function runBackup_() {
+  var ss = spreadsheet_(backupPage_());
+  var summary = summarySheet_(ss);
+  var now = new Date();
+  var counts = [];
+  var data = {};
+  SCHEMA.pages.forEach(function (page) {
+    if (page.kind === 'backup') return;
+    var headers = page.columns.map(function (c) { return c.header; });
+    var values = [];
+    pageSheets_(page).sort(byName_).forEach(function (sheet) {
+      readSheet_(sheet).rows.forEach(function (r) {
+        values.push(headers.map(function (h) {
+          var v = r.data[h];
+          return v === undefined || v === null ? '' : escapeCell_(v);
+        }));
+      });
+    });
+    data[page.key] = values;
+    var old = ss.getSheetByName(page.title);
+    if (old) ss.deleteSheet(old);
+    var sheet = tab_(ss, page.title, page, ss.getSheets().length);
+    if (values.length) {
+      ensureSize_(sheet, values.length + 1, headers.length);
+      sheet.getRange(2, 1, values.length, headers.length).setValues(values);
+    }
+    counts.push([page.title, values.length]);
+  });
+  writeSummary_(summary, now, counts, totals_(data));
+  PropertiesService.getScriptProperties().setProperty('LAST_BACKUP', now.toISOString());
+  var byPage = {};
+  counts.forEach(function (c) { byPage[c[0]] = c[1]; });
+  return { url: ss.getUrl(), at: now.toISOString(), counts: byPage };
+}
+
+function totals_(data) {
+  return SUMMARY_TOTALS.map(function (t) {
+    var page = dataPage_(t.page);
+    var idx = page.columns.indexOf(column_(page, t.key));
+    var whereIdx = t.where ? page.columns.indexOf(column_(page, t.where[0])) : -1;
+    var sum = 0;
+    (data[t.page] || []).forEach(function (row) {
+      if (t.where && row[whereIdx] !== t.where[1]) return;
+      var n = Number(row[idx]);
+      if (row[idx] !== '' && isFinite(n)) sum += n;
+    });
+    return { label: t.label, value: Math.round(sum * 1000) / 1000, money: Boolean(t.money) };
+  });
+}
+
+function writeSummary_(sheet, now, counts, totals) {
+  sheet.clear();
+  var rows = [['WR backup', ''], ['Backed up', now], ['', ''], ['Page', 'Rows']]
+    .concat(counts)
+    .concat([['', ''], ['Totals', '']])
+    .concat(totals.map(function (t) { return [t.label, t.value]; }));
+  ensureSize_(sheet, rows.length, 2);
+  sheet.getRange(1, 1, rows.length, 2).setValues(rows);
+  sheet.getRange(1, 1).setFontWeight('bold').setFontSize(16);
+  sheet.getRange(2, 2).setNumberFormat('yyyy-mm-dd hh:mm');
+  [4, counts.length + 6].forEach(function (r) {
+    sheet.getRange(r, 1, 1, 2).setFontWeight('bold').setBackground(HEADER_BG).setFontColor(HEADER_FG);
+  });
+  totals.forEach(function (t, i) {
+    if (t.money) sheet.getRange(counts.length + 7 + i, 2).setNumberFormat('$#,##0.00');
+  });
+  sheet.setColumnWidth(1, 320);
+  sheet.setColumnWidth(2, 160);
+}
+
+function status_() {
+  var props = PropertiesService.getScriptProperties();
+  var sheets = {};
+  SCHEMA.pages.forEach(function (p) {
+    var id = props.getProperty('SS_' + p.key);
+    if (id) sheets[p.key] = 'https://docs.google.com/spreadsheets/d/' + id + '/edit';
+  });
+  var root = props.getProperty('ROOT_FOLDER_ID');
+  return {
+    version: WR_VERSION,
+    timeZone: TIME_ZONE,
+    lastBackup: props.getProperty('LAST_BACKUP') || '',
+    backupUrl: sheets.backup || '',
+    folderUrl: root ? 'https://drive.google.com/drive/folders/' + root : '',
+    autoBackup: hasBackupTrigger_(),
+    sheets: sheets,
+  };
+}
+
+function hasBackupTrigger_() {
+  return ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'scheduledBackup'; });
+}
+
+function ensureBackupTrigger_() {
+  if (hasBackupTrigger_()) return;
+  ScriptApp.newTrigger('scheduledBackup').timeBased().onMonthDay(1).atHour(2).inTimezone(TIME_ZONE).create();
+}
+
+// ------------------------- spreadsheets and tabs ----------------------------
+
+var spreadsheetCache_ = {};
+
+function spreadsheet_(page) {
+  if (spreadsheetCache_[page.key]) return spreadsheetCache_[page.key];
+  var props = PropertiesService.getScriptProperties();
+  var prop = 'SS_' + page.key;
+  var id = props.getProperty(prop);
+  var ss = null;
+  if (id) {
+    try {
+      if (!DriveApp.getFileById(id).isTrashed()) ss = SpreadsheetApp.openById(id);
+    } catch (e) { ss = null; }
+  }
+  if (!ss) {
+    ss = SpreadsheetApp.create(page.spreadsheet);
+    ss.setSpreadsheetTimeZone(TIME_ZONE);
+    DriveApp.getFileById(ss.getId()).moveTo(rootFolder_());
+    props.setProperty(prop, ss.getId());
+  }
+  spreadsheetCache_[page.key] = ss;
+  return ss;
+}
+
+function mainTab_(page) {
+  return tab_(spreadsheet_(page), page.title, page);
+}
+
+function monthTab_(ss, page, month) {
+  var name = monthTabName_(month);
+  var newer = monthSheets_(ss).filter(function (s) { return s.getName() > name; }).length;
+  return tab_(ss, name, page, newer);
+}
+
+function monthSheets_(ss) {
+  return ss.getSheets().filter(function (s) { return /^\d{4}-\d{2}( |$)/.test(s.getName()); });
+}
+
+function pageSheets_(page) {
+  return page.kind === 'month-tabs' ? monthSheets_(spreadsheet_(page)) : [mainTab_(page)];
+}
+
+function summarySheet_(ss) {
+  var sheet = ss.getSheetByName('Summary');
+  if (sheet) return sheet;
+  var sheets = ss.getSheets();
+  if (sheets.length === 1 && sheets[0].getLastRow() === 0 && !isWrTabName_(sheets[0].getName())) {
+    return sheets[0].setName('Summary');
+  }
+  return ss.insertSheet('Summary', 0);
+}
+
+/** The tab with this name, created (or the blank first tab renamed) with headers if needed. */
+function tab_(ss, name, page, index) {
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    var sheets = ss.getSheets();
+    if (sheets.length === 1 && sheets[0].getLastRow() === 0 && !isWrTabName_(sheets[0].getName())) {
+      sheet = sheets[0].setName(name);
+    } else {
+      sheet = ss.insertSheet(name, index === undefined ? sheets.length : index);
+    }
+  }
+  ensureHeaders_(sheet, page.columns);
+  return sheet;
+}
+
+function isWrTabName_(name) {
+  if (name === 'Summary' || /^\d{4}-\d{2}( |$)/.test(name)) return true;
+  return SCHEMA.pages.some(function (p) { return p.title === name; });
+}
+
+/** Adds any missing column headers (at the end), styled and formatted. */
+function ensureHeaders_(sheet, columns) {
+  var current = headers_(sheet);
+  var missing = columns.filter(function (c) { return current.indexOf(c.header) === -1; });
+  if (!missing.length) return current;
+  var start = current.length + 1;
+  var total = current.length + missing.length;
+  ensureSize_(sheet, 2, total);
+  sheet.getRange(1, start, 1, missing.length).setValues([missing.map(function (c) { return c.header; })]);
+  missing.forEach(function (col, i) { styleColumn_(sheet, start + i, col); });
+  sheet.getRange(1, 1, 1, total).setFontWeight('bold').setBackground(HEADER_BG).setFontColor(HEADER_FG);
+  sheet.setFrozenRows(1);
+  return headers_(sheet);
+}
+
+function headers_(sheet) {
+  var lastCol = sheet.getLastColumn();
+  if (!lastCol) return [];
+  return sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function (h) { return String(h).trim(); });
+}
+
+function styleColumn_(sheet, c, col) {
+  var rows = sheet.getMaxRows() - 1;
+  if (rows > 0) {
+    var range = sheet.getRange(2, c, rows, 1);
+    var format = numberFormat_(col);
+    if (format) range.setNumberFormat(format);
+    if (col.options) {
+      range.setDataValidation(SpreadsheetApp.newDataValidation()
+        .requireValueInList(col.options, true).setAllowInvalid(true).build());
+    }
+  }
+  sheet.setColumnWidth(c, { photos: 280, url: 280, email: 200, text: 180, timestamp: 140, money: 120 }[col.type] || 130);
+}
+
+function numberFormat_(col) {
+  if (col.type === 'money') return '$#,##0.00';
+  if (col.type === 'timestamp') return 'yyyy-mm-dd hh:mm';
+  if (col.type === 'number') return col.decimals ? '0.' + new Array(col.decimals + 1).join('0') : null;
+  return TEXT_TYPES.indexOf(col.type) !== -1 ? '@' : null;
+}
+
+function ensureSize_(sheet, rows, cols) {
+  if (cols && sheet.getMaxColumns() < cols) sheet.insertColumnsAfter(sheet.getMaxColumns(), cols - sheet.getMaxColumns());
+  if (rows && sheet.getMaxRows() < rows) sheet.insertRowsAfter(sheet.getMaxRows(), rows - sheet.getMaxRows());
+}
+
+// --------------------------------- helpers ---------------------------------
+
+function folder_(prop, name, parent) {
+  var props = PropertiesService.getScriptProperties();
+  var id = props.getProperty(prop);
+  if (id) {
+    try {
+      var existing = DriveApp.getFolderById(id);
+      if (!existing.isTrashed()) return existing;
+    } catch (e) { /* recreate below */ }
+  }
+  var folder = parent ? parent.createFolder(name) : DriveApp.createFolder(name);
+  props.setProperty(prop, folder.getId());
+  return folder;
+}
+
+function rootFolder_() {
+  return folder_('ROOT_FOLDER_ID', 'WR', null);
+}
+
+function dataPage_(key) {
+  var page = SCHEMA.pages.filter(function (p) { return p.key === key && p.kind !== 'backup'; })[0];
+  if (!page) throw wrError_('bad_request', 'Unknown page.');
+  return page;
+}
+
+function backupPage_() {
+  return SCHEMA.pages.filter(function (p) { return p.kind === 'backup'; })[0];
+}
+
+function column_(page, key) {
+  return page.columns.filter(function (c) { return c.key === key; })[0];
+}
+
+function header_(page, key) {
+  return column_(page, key).header;
+}
+
+function monthKey_(date) {
+  return Utilities.formatDate(date, TIME_ZONE, 'yyyy-MM');
+}
+
+function monthTabName_(month) {
+  return month + ' ' + MONTH_NAMES[Number(month.slice(5, 7)) - 1];
+}
+
+function byName_(a, b) {
+  return a.getName() < b.getName() ? -1 : a.getName() > b.getName() ? 1 : 0;
+}
+
+function lines_(cell) {
+  return String(cell || '').split(/\s*\n\s*/).filter(function (s) { return s; });
+}
+
+function parseDate_(v) {
+  if (!v) return null;
+  var d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function isDate_(v) {
+  return Object.prototype.toString.call(v) === '[object Date]';
+}
+
+function formatBytes_(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return Math.round(n / 1024) + ' KB';
+  return Math.round(n / (1024 * 1024) * 10) / 10 + ' MB';
+}
+
+function newKey_() {
+  return 'wr-' + Utilities.getUuid().replace(/-/g, '');
+}
+
+function safeEqual_(a, b) {
+  if (a.length !== b.length) return false;
+  var diff = 0;
+  for (var i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+function withLock_(fn) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function wrError_(code, message) {
+  var err = new Error(message);
+  err.code = code;
+  return err;
+}
+
+function json_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}

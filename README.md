@@ -1,38 +1,47 @@
 # WR
 
-A personal client tracker for iPhone. You can add clients with contact details, product photos, wood type, base type (wood, steel or hybrid), amount, payment status and delivery status. The app shows running totals and lets you search and filter clients.
+The Wood for Life business app for iPhone. The Welcome page leads to nine pages:
 
-It's an installable web app. All data stays **on your device** (in IndexedDB). There's no account and no server, and it works offline.
+| Page | What it keeps |
+|---|---|
+| Client info | Name, phone, e-mail, product photos, wood type, base type, payment status, paid amount |
+| Monthly expenses | 24 expense categories per month, with a live total |
+| Client info monthly | Monthly client entries (name, items, wood type, amount paid, total), one sheet tab per month |
+| VAT | QTY × unit price, with VAT 11% and the total due calculated for you |
+| Packing & Shipments | Items with dimensions, quantity, wood type, volume (calculated) and weight |
+| WR-Documents | PDFs, photos, Word, Excel… stored privately in Google Drive |
+| Raw Stockage | Raw wood: type, quantity, dimensions |
+| Finished Stockage | Finished products: photos, wood type, dimensions, base |
+| Backup | Copies every page into the "WR Backup" Google Sheet (also automatic on the 1st of each month) |
+
+Data lives in **Google Sheets and Drive** in the Woodforlife2019@gmail.com account. Entries made without internet are kept on the phone and upload automatically later.
 
 ## Install on iPhone
 
-1. Open the app's address in **Safari**.
-2. Tap **Share** → **Add to Home Screen** → **Add**.
-3. Always open WR from the Home Screen icon. The Home Screen app keeps its own data, separate from Safari tabs.
+1. Open https://mahmudmaatuk-boop.github.io/wr/ in **Safari**.
+2. **Share** → **Add to Home Screen**.
+3. Open WR from the icon, tap **⚙**, and connect it to Google Sheets ([setup guide](docs/SETUP-GOOGLE.md)).
 
-## Back up your data
+## How it's built
 
-Your data lives only on your phone. If you remove WR from the Home Screen, its data is removed too. To back up:
-
-- **Settings → Export backup → Save backup file**, then choose *Save to Files* (iCloud Drive is a good place).
-- To restore, go to **Settings → Import backup** and pick the file. Clients in the backup replace their copies on the phone, and every other client is kept.
-
-## Development
-
-No build step and no dependencies. It's plain HTML, CSS and ES modules.
-
-```bash
-npm test                      # unit tests for model + backup logic (node --test)
-python3 -m http.server 5180   # serve locally, then open http://localhost:5180
-```
+There's no build step for the app: it's plain HTML, CSS and ES modules served by GitHub Pages. The Google side is one Apps Script file.
 
 | Path | Purpose |
 |---|---|
-| `js/model.js` | Pure logic: validation, money parsing, totals, search/filter |
-| `js/backup.js` | Backup file format (build/parse/validate) |
-| `js/db.js` | IndexedDB storage (clients + photos stores) |
-| `js/images.js` | Photo downscaling (1600px full, 400px thumbnail) |
-| `js/views/*` | Screens: list, detail, form, settings |
-| `sw.js` | Offline support (network-first, cache fallback) |
+| `js/schema.js` | Every page's fields: the single source for both the app and the Google side |
+| `js/pages.js` | Per-page look: icons, button text, calculations, list layout |
+| `js/components/` | Generic form and saved-entries list |
+| `js/views/` | Screens: welcome, page, expenses, documents, backup, settings |
+| `js/sync.js`, `js/outbox.js`, `js/store.js` | Offline outbox and on-phone copy (IndexedDB `wr2`) |
+| `js/api.js` | Talks to the Apps Script web app |
+| `apps-script/src/server.js` | The Google Apps Script server |
+| `apps-script/Code.gs` | Generated: schema + server in one file to paste into script.google.com |
+| `dev/` | Fake Google services and a local server for testing |
 
-**Shipping an update:** bump `APP_VERSION` in `js/version.js` and `CACHE_VERSION` in `sw.js`. If you add a file, also add it to `SHELL` in `sw.js`.
+```bash
+npm test        # unit tests, plus the real server code run against fake Sheets and Drive
+npm run build   # regenerate apps-script/Code.gs after changing schema.js or server.js
+npm run dev     # http://localhost:5180 with a fake Google backend (script URL …/api, key "dev-key")
+```
+
+**Shipping a change:** bump the version in `js/version.js`, `sw.js` (`CACHE_VERSION`) and `apps-script/src/server.js` (`WR_VERSION`), then run `npm run build`. The tests check that these match and that every app file is in the offline list. If the server changed, paste the new `Code.gs` and deploy a new version (see the setup guide).
