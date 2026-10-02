@@ -1,10 +1,12 @@
 {
   "name": "wr",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "WR — personal client tracker (installable web app)",
+  "description": "WR: Wood for Life business app (installable web app + Google Apps Script)",
   "scripts": {
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js",
+    "build": "node scripts/build-gas.mjs",
+    "dev": "node dev/mock-server.mjs"
   }
 }
